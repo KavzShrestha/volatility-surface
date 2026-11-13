@@ -9,6 +9,7 @@ Tabs:
   4. IV explorer                pick any strike & expiry: surface IV, price, Greeks; or step through
                                 the Newton solve for one listed quote
   5. Diagnostics                arbitrage checks, out-of-sample fit
+  6. Backtest                   delta-hedged ATM straddles on SPX/VIX since 1990: does selling vol pay?
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from engine import VolSurface, bs_greeks, bs_price, implied_vol, put_call_parity_residual
+from engine.backtest import Execution, cost_breakdown, load_history, measure_option_spread, run_backtest, summarize
 from engine.data import CBOE_URL, YEAR_SECONDS, fetch_cboe_chain, prepare_quotes, synthetic_chain
 
 st.set_page_config(page_title="Vol Surface Engine", layout="wide")
@@ -115,8 +117,8 @@ c3.metric("Listed options", f"{stats['raw']:,}")
 c4.metric("Clean OTM quotes", f"{stats['clean']:,}")
 c5.metric("Expiries fitted", stats["expiries_used"])
 
-tab_bs, tab_data, tab_surf, tab_iv, tab_diag = st.tabs(
-    ["Black-Scholes calculator", "Market data", "Volatility surface", "IV explorer", "Diagnostics"])
+tab_bs, tab_data, tab_surf, tab_iv, tab_diag, tab_bt = st.tabs(
+    ["Black-Scholes calculator", "Market data", "Volatility surface", "IV explorer", "Diagnostics", "Backtest"])
 
 # ============================================================================ 1. Black-Scholes
 with tab_bs:
@@ -264,8 +266,12 @@ with tab_surf:
     st.subheader("Implied volatility surface")
     a, b, c = st.columns([2, 2, 1])
     m_lo, m_hi = a.slider("Strike range (K / spot)", 0.5, 1.5, (0.8, 1.15), 0.01)
-    t_lo, t_hi = b.slider("Expiry range (days)", float(max(1, surf.T[0] * 365)), float(surf.T[-1] * 365),
-                          (float(surf.T[0] * 365), float(surf.T[-1] * 365)))
+    d_min, d_max = float(surf.T[0] * 365), float(surf.T[-1] * 365)
+    if d_max - d_min < 0.5:  # a single expiry (or near-identical ones): nothing to slide over
+        b.caption(f"Only one expiry fitted ({d_min:.1f} days); loosen the sidebar filters for a full surface.")
+        t_lo, t_hi = max(d_min - 1.0, 0.01), d_max + 1.0
+    else:
+        t_lo, t_hi = b.slider("Expiry range (days)", d_min, d_max, (d_min, d_max))
     mask_extrap = c.toggle("Hide extrapolated", True, help="Blank out points outside the quoted moneyness range")
     show_pts = c.toggle("Show market IVs", True)
 
@@ -460,3 +466,235 @@ with tab_diag:
     st.dataframe(arb.round(2), hide_index=True, width="stretch")
     st.caption("butterfly: call price not convex in strike (negative density). monotonic: call price rising with "
                "strike. calendar: total variance falling vs the previous expiry.")
+
+
+# ============================================================================ 6. Backtest
+@st.cache_data(ttl=24 * 3600, show_spinner="Loading SPX and VIX history from CBOE…")
+def bt_history():
+    return load_history()
+
+
+@st.cache_data(show_spinner="Running backtest (a few seconds)…", max_entries=32)
+def bt_run(market, **kw):
+    res = run_backtest(market, **kw)
+    return res.daily, res.trades, summarize(res), cost_breakdown(res)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def vix_now():
+    return fetch_cboe_chain("_VIX")[0] / 100
+
+
+with tab_bt:
+    st.subheader("Does selling implied vol make money? Delta-hedged straddle backtest")
+    st.caption("Every N days, open an at-the-money SPX straddle priced at VIX, delta-hedge it with E-mini futures "
+               "at each daily close, hold to expiry, roll. Costs come from whole contracts, today's measured option "
+               "bid-ask and published fee schedules. P&L in % of notional, summed (not compounded).")
+    with st.expander("What this means, in plain English"):
+        st.markdown("""
+**The trade.** A *straddle* is one call plus one put at the same strike. Buying one costs a premium and pays
+off if the index moves a lot in *either* direction, so it is a bet on movement, not direction. That is
+**long volatility**. Selling one collects the premium and keeps it if the index stays calm: **short volatility**.
+
+**Delta hedging.** A straddle still picks up some directional exposure as the index moves (its *delta*).
+Every day at the close we trade S&P futures to cancel that delta. After hedging, what is left is a pure bet:
+*will the index actually move more or less than the option price implied?*
+
+**Why the P&L is ½Γ S² (realised − implied variance).** Each day a hedged *long* straddle makes
+½·Γ·(day's move)² from re-hedging (buying low, selling high) and pays *theta* (time decay). The option is priced
+so that theta exactly pays for moves of the size implied vol expects. Moves bigger than that: the long side wins.
+Smaller: the short side keeps the difference. Γ (gamma) sets how much each squared move is worth.
+
+**Implied vs realised vol.** *Implied* is what the option price says (we use VIX). *Realised* is what actually
+happened: for each trade we take the daily close-to-close log returns from entry to expiry, square them, add
+them up, scale to a year (× 365 / days held) and take the square root. No mean is subtracted (the variance-swap
+convention), and calendar days are used because option expiry and VIX are measured in calendar time.
+
+**Notional and units.** Each trade buys or sells whole SPX option contracts worth about the chosen dollar
+notional (SPX contract = $100 × index). P&L is shown as % of that notional so 1990 and 2026 are comparable.
+Returns are added up, not compounded.
+
+**Data.** Daily SPX and VIX closes from CBOE's public history files, not the option chain in the other tabs.
+The chain is used only to measure today's option bid-ask and how far VIX sits above ATM implied vol.
+""")
+    try:
+        hist = bt_history()
+    except Exception as e:
+        st.error(f"Could not load SPX/VIX history from CBOE ({e!r}).")
+        st.stop()
+
+    # Measure today's costs from the live chain loaded above (not available for the synthetic chain).
+    measured = None
+    if label != "SYNTHETIC":
+        try:
+            measured = measure_option_spread(quotes, 30)
+            measured["vix"] = vix_now()
+        except Exception:
+            measured = None
+    default_spread = round(measured["half_spread_vol"], 3) if measured else Execution.option_half_spread_vol
+    if measured:
+        gap = 100 * (measured["vix"] - measured["atm_iv"])
+        st.info(f"**Measured from today's SPX chain:** {measured['days']:.0f}-day ATM options quote "
+                f"±{measured['half_spread_pts']:.2f} index pts around mid = **±{measured['half_spread_vol']:.3f} vol pts**. "
+                f"VIX is {measured['vix'] * 100:.2f} vs ATM implied vol {measured['atm_iv'] * 100:.2f}: "
+                f"**VIX sits {gap:+.2f} vol pts above** what an ATM straddle actually trades at today. "
+                f"Set the haircut near that to price straddles realistically (one day's reading; the gap moves with skew).")
+    else:
+        st.info("Switch the sidebar to the live CBOE chain to measure today's option spread and VIX-vs-ATM gap.")
+
+    with st.form("bt_form"):
+        a, b, c, d = st.columns(4)
+        bt_side = a.radio("Position", ["Sell straddles (short vol)", "Buy straddles (long vol)"])
+        bt_hedge = a.toggle("Delta-hedge daily", True)
+        bt_real = a.toggle("Realistic execution", True, help="Off = frictionless: fractional contracts, perfect hedge, no costs")
+        y0, y1 = int(hist.index[0].year), int(hist.index[-1].year)
+        bt_years = b.slider("Years", y0, y1, (y0, y1))
+        bt_tenor = b.select_slider("Tenor (calendar days)", [7, 14, 30, 60, 90], 30)
+        bt_haircut = b.slider("VIX haircut (vol pts)", 0.0, 6.0, 0.0, 0.25,
+                              help="VIX includes the skew and sits above ATM IV; subtract this to price the straddle "
+                                   "where it actually trades. See the measured gap above.")
+        bt_notional = c.select_slider("Notional per trade ($)", [250_000, 1_000_000, 10_000_000, 100_000_000],
+                                      10_000_000, format_func=lambda v: f"${v:,.0f}")
+        bt_fut = c.radio("Hedge with", ["E-mini S&P (ES, $50 × index)", "Micro E-mini (MES, $5 × index)"])
+        bt_rate = c.number_input("Flat rate", value=0.03, step=0.005, format="%.3f")
+        bt_spread = d.number_input("Option half-spread (vol pts)", value=float(default_spread), min_value=0.0,
+                                   step=0.01, format="%.3f",
+                                   help="Pre-filled with today's measured value. Spreads were wider in the 1990s.")
+        bt_ofee = d.number_input("Option fee ($/contract/side)", value=1.50, min_value=0.0, step=0.25)
+        bt_ffee = d.number_input("Futures fee ($/contract/side)", value=2.00 if bt_fut.startswith("E-mini") else 0.60,
+                                 min_value=0.0, step=0.10)
+        st.form_submit_button("Run backtest", type="primary")
+
+    mkt = hist.loc[str(bt_years[0]):str(bt_years[1])]
+    sgn = -1 if bt_side.startswith("Sell") else 1
+    kw = dict(side=sgn, tenor_days=bt_tenor, r=bt_rate, q=0.015, iv_haircut=bt_haircut, hedge=bt_hedge)
+    if (mkt.index[-1] - mkt.index[0]).days < 3 * bt_tenor:
+        st.warning("Pick a longer period.")
+        st.stop()
+    ex = Execution(notional=float(bt_notional), option_half_spread_vol=bt_spread, option_fee=bt_ofee,
+                   fut_multiplier=50.0 if bt_fut.startswith("E-mini") else 5.0, fut_half_spread_pts=0.125,
+                   fut_fee=bt_ffee) if bt_real else None
+    daily, trades, summ, costs = bt_run(mkt, execution=ex, **kw)
+    daily0, trades0, summ0, _ = bt_run(mkt, execution=None, **kw)
+
+    cols = st.columns(6)
+    cols[0].metric("Annual return", f"{summ['annual return %']:+.2f}%",
+                   delta=f"{summ['annual return %'] - summ0['annual return %']:+.2f}% vs frictionless", delta_color="off")
+    cols[1].metric("Sharpe", f"{summ['sharpe']:.2f}", help="Flatters strategies with crash risk: check drawdown")
+    cols[2].metric("Max drawdown", f"{summ['max drawdown %']:.2f}%")
+    cols[3].metric("Win rate", f"{summ['win rate %']:.0f}%", help=f"{summ['trades']} trades")
+    cols[4].metric("Implied − realised", f"{summ['avg implied - realised (vol pts)']:+.2f} pts",
+                   help=f"Implied above realised in {summ['implied > realised (% of trades)']:.0f}% of trades")
+    cols[5].metric("Worst trade", f"{summ['worst trade %']:.2f}%", help=f"entered {summ['worst trade entry']}")
+
+    if ex is not None:
+        st.markdown("**What hedging and trading actually cost**")
+        yrs = (daily.index[-1] - daily.index[0]).days / 365.25
+        cc = st.columns(4)
+        cc[0].metric("SPX straddles per trade", f"{trades['straddles'].median():.0f}",
+                     help=f"Median. {trades['straddles'].iloc[0]:.0f} in {trades['entry'].iloc[0]:%Y}, "
+                          f"{trades['straddles'].iloc[-1]:.0f} in {trades['entry'].iloc[-1]:%Y} as SPX rose")
+        cc[1].metric("Futures contracts traded per trade", f"{trades['futures_traded'].median():.0f}",
+                     help="Median, including the opening hedge and the unwind at expiry")
+        cc[2].metric("Total costs per year", f"${costs.loc['TOTAL', '$ per yr']:,.0f}",
+                     help=f"{-summ['costs, annual %']:.2f}% of notional per year")
+        cc[3].metric("Costs as % of gross P&L", f"{costs.loc['TOTAL', '% of gross P&L']:.1f}%")
+        st.dataframe(costs, width="stretch",
+                     column_config={"% of notional / yr": st.column_config.NumberColumn(format="%.3f"),
+                                    "$ per trade": st.column_config.NumberColumn(format="$%,.0f"),
+                                    "$ per yr": st.column_config.NumberColumn(format="$%,.0f"),
+                                    "% of gross P&L": st.column_config.NumberColumn(format="%.2f")})
+        st.caption("Option spread: half the bid-ask × straddle vega, paid once (held to expiry, cash-settled). "
+                   "Futures spread: half a 0.25 tick per contract on every hedge trade. Hedging uses whole "
+                   "contracts, so small delta changes are left unhedged until they add up to a contract.")
+
+    left, right = st.columns(2)
+    with left:
+        cum, cum0 = daily["pnl"].cumsum() * 100, daily0["pnl"].cumsum() * 100
+        fig = go.Figure()
+        fig.add_scatter(x=cum0.index, y=cum0, mode="lines", name="before costs", line=dict(color="gray", width=1))
+        fig.add_scatter(x=cum.index, y=cum, mode="lines", name="after costs", line=dict(color=MARKET, width=2))
+        fig.add_scatter(x=cum.index, y=cum - cum.cummax(), mode="lines", name="drawdown", fill="tozeroy",
+                        line=dict(color="#d03b3b", width=1), yaxis="y2")
+        for _, t in trades.nsmallest(3, "pnl").iterrows():
+            fig.add_vrect(x0=t["entry"], x1=t["expiry"], fillcolor="#d03b3b", opacity=0.15, line_width=0)
+        fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
+                          title="Cumulative P&L, % of notional (red bands = 3 worst trades)",
+                          yaxis=dict(title="cumulative P&L %", domain=[0.3, 1]),
+                          yaxis2=dict(title="drawdown %", domain=[0, 0.22]), legend=dict(orientation="h", y=-0.08))
+        st.plotly_chart(fig, width="stretch")
+    with right:
+        x = (trades0["entry_iv"] - trades0["realised_vol"]) * 100
+        y = trades0["pnl_before_costs"] * 100
+        fig = go.Figure(go.Scatter(x=x, y=y, mode="markers", marker=dict(color=MARKET, size=6, opacity=0.6),
+                                   customdata=np.c_[trades0["entry"].dt.strftime("%Y-%m-%d"),
+                                                    trades0["entry_iv"] * 100, trades0["realised_vol"] * 100],
+                                   hovertemplate="entry %{customdata[0]}<br>implied %{customdata[1]:.1f}%, realised "
+                                                 "%{customdata[2]:.1f}%<br>P&L %{y:.2f}%<extra></extra>",
+                                   name="trades"))
+        if len(x) > 2:
+            slope, icpt = np.polyfit(x, y, 1)
+            xs = np.array([x.min(), x.max()])
+            fig.add_scatter(x=xs, y=icpt + slope * xs, mode="lines", line=dict(color=MODEL, width=2),
+                            name=f"fit, corr {np.corrcoef(x, y)[0, 1]:.2f}")
+        fig.add_hline(y=0, line=dict(color="gray", width=1))
+        fig.add_vline(x=0, line=dict(color="gray", width=1))
+        fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10),
+                          title="Each trade: P&L before costs vs implied − realised vol",
+                          xaxis_title="implied at entry − realised over trade (vol pts)",
+                          yaxis_title="trade P&L (% of notional)", legend=dict(orientation="h", y=-0.15))
+        st.plotly_chart(fig, width="stretch")
+
+    left, right = st.columns(2)
+    with left:
+        tt = trades.set_index("entry")
+        fig = go.Figure()
+        fig.add_scatter(x=tt.index, y=tt["entry_iv"] * 100, mode="lines", name="implied at entry",
+                        line=dict(color=MARKET, width=1.5))
+        fig.add_scatter(x=tt.index, y=tt["realised_vol"] * 100, mode="lines", name="realised over trade",
+                        line=dict(color=MODEL, width=1.5))
+        fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
+                          title="Implied vs subsequently realised vol (the variance risk premium)",
+                          yaxis_title="vol %", legend=dict(orientation="h", y=-0.12))
+        st.plotly_chart(fig, width="stretch")
+    with right:
+        names = {"realised_vs_implied": "realised vs implied (gamma − theta)", "vega": "vega (IV changes)",
+                 "delta": "hedge rounding / unhedged delta", "residual": "vanna/volga, discrete hedging",
+                 "costs": "costs"}
+        palette = [MARKET, MODEL, "#eda100", TRUTH, "#d03b3b"]
+        fig = go.Figure()
+        for col_, color in zip(names, palette):
+            if daily[col_].abs().sum() > 0:
+                fig.add_scatter(x=daily.index, y=daily[col_].cumsum() * 100, mode="lines", name=names[col_],
+                                line=dict(color=color, width=1.5))
+        fig.add_scatter(x=daily.index, y=daily["pnl"].cumsum() * 100, mode="lines", name="total",
+                        line=dict(color="black", width=2.5))
+        fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
+                          title="P&L attribution, cumulative % of notional", legend=dict(orientation="h", y=-0.12))
+        st.plotly_chart(fig, width="stretch")
+
+    yearly = daily["pnl"].groupby(daily.index.year).sum() * 100
+    fig = go.Figure(go.Bar(x=yearly.index, y=yearly, marker_color=np.where(yearly >= 0, MARKET, "#d03b3b"),
+                           hovertemplate="%{x}: %{y:+.2f}%<extra></extra>"))
+    fig.update_layout(height=260, margin=dict(l=10, r=10, t=30, b=10),
+                      title=f"P&L by year, after costs (losing years: {(yearly < 0).sum()} of {len(yearly)})",
+                      yaxis_title="% of notional")
+    st.plotly_chart(fig, width="stretch")
+
+    st.markdown("**Worst trades**")
+    show = trades.nsmallest(10, "pnl").assign(
+        entry_iv=lambda t: t["entry_iv"] * 100, realised_vol=lambda t: t["realised_vol"] * 100,
+        premium=lambda t: t["premium"] * 100, pnl=lambda t: t["pnl"] * 100)
+    st.dataframe(show[["entry", "expiry", "entry_iv", "realised_vol", "premium", "pnl"]], hide_index=True,
+                 width="stretch",
+                 column_config={"entry": st.column_config.DateColumn(format="YYYY-MM-DD"),
+                                "expiry": st.column_config.DateColumn(format="YYYY-MM-DD"),
+                                "entry_iv": st.column_config.NumberColumn("implied %", format="%.2f"),
+                                "realised_vol": st.column_config.NumberColumn("realised %", format="%.2f"),
+                                "premium": st.column_config.NumberColumn("premium %", format="%.2f"),
+                                "pnl": st.column_config.NumberColumn("P&L %", format="%.2f")})
+    st.download_button("Download trades CSV", trades.to_csv(index=False), "backtest_trades.csv", "text/csv")
+    st.info("**Read the result as an upper bound.** VIX is a variance-swap rate that includes the put skew, so it "
+            "overstates the ATM vol a straddle trades at: the haircut matters far more than trading costs. Other "
+            "simplifications: one VIX level marks the option for its whole life, flat r and q, hedging only at closes, "
+            "today's spreads and contract specs applied to all years, no margin.")
